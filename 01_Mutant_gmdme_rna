@@ -1,1 +1,983 @@
+#从诺禾云盘下载数据：1.下载客户端  wget https://data-deliver.novogene.com/linuxnd.zip 2.解压软件  unzip linuxnd.zip 3.  ./linuxnd/lnd login -u 用户名 -p 密码 4.查看目录  ./linuxnd/lnd list 5.数据下载  ./linuxnd/lnd cp -d oss：//目录名 本地目录
+md5sum -c MD5.txt #检查数据
+#该数据有4个样本：Wm82-1、Wm82-2、Gmdme-1、Gmdme-2
+#原始数据位置：/mnt/nfs2/stu_fy/hms/Mutant_gmdme_rnaseq
+#参考基因组位置：/mnt/nfs2/stu_fy/hms/RNAseq_Data/Gmax_508_Wm82/
 
+#fastp质控
+conda activate rnaseq
+cd /data/mshe/Mutant_gmdme_rna
+mkdir -p {clean,qc,logs}
+for i in {Gmdme-1,Gmdme-2,Wm82-1,Wm82-2};do
+  fastp \
+    -i "/mnt/nfs2/stu_fy/hms/Mutant_gmdme_rnaseq/01.RawData/${i}/${i}_1.fq.gz" \
+    -I "/mnt/nfs2/stu_fy/hms/Mutant_gmdme_rnaseq/01.RawData/${i}/${i}_2.fq.gz" \
+    -o "clean/${i}_R1.clean.fq.gz" \
+    -O "clean/${i}_R2.clean.fq.gz" \
+    -h "qc/${i}.fastp.html" \
+    -j "qc/${i}.fastp.json" \
+    --detect_adapter_for_pe \
+    -q 20 -u 30 -n 5 -l 50 \
+    -w 10 \
+    2> "logs/${i}.fastp.log"
+done
+
+#hisat2建立索引、比对
+mkdir -p index bam
+REF_FA="/mnt/nfs2/stu_fy/hms/RNAseq_Data/Gmax_508_Wm82/Gmax_508_v4.0.fa"
+EXON="/mnt/nfs2/stu_fy/hms/RNAseq_Data/Gmax_508_Wm82/Gmax_508_Wm82.a4.v1.exon.txt"
+SS="/mnt/nfs2/stu_fy/hms/RNAseq_Data/Gmax_508_Wm82/Gmax_508_Wm82.a4.v1.ss.txt"
+hisat2-build --exon "$EXON" --ss "$SS" -p 24 "$REF_FA" index/Gmax_508_v4.0.hisat2_index 2> logs/hisat2_build_index.log
+for s in Wm82-1 Wm82-2 Gmdme-1 Gmdme-2; do
+  echo "[INFO] hisat2: $s"
+
+  hisat2 -p 20 --dta -x index/Gmax_508_v4.0.hisat2_index \
+    -1 "clean/${s}_R1.clean.fq.gz" \
+    -2 "clean/${s}_R2.clean.fq.gz" \
+    2> "logs/${s}.hisat2.log" \
+  | samtools sort -@ 10 -o "bam/${s}.sorted.bam"
+
+  samtools index "bam/${s}.sorted.bam"
+done
+#快速检查每个样本的比对率
+grep "overall alignment rate" -n logs/*.hisat2.log
+
+#生成counts矩阵
+mkdir -p count
+GTF="/mnt/nfs2/stu_fy/hms/RNAseq_Data/Gmax_508_Wm82/Gmax_508_Wm82.a4.v1.gene.gtf"
+featureCounts -T 20 -p -B -C -s 0 \
+  -a "$GTF" \
+  -o count/gene_counts.txt \
+  bam/*.sorted.bam \
+  2> logs/featureCounts.log
+#检查整体分配情况
+grep -E "Assigned|Unassigned|Successfully assigned" -n logs/featureCounts.log | head -n 50
+
+#生成abundance文件
+mkdir -p stringtie/abund stringtie/gtf stringtie/logs
+GTF="/mnt/nfs2/stu_fy/hms/RNAseq_Data/Gmax_508_Wm82/Gmax_508_Wm82.a4.v1.gene.gtf"
+for s in Wm82-1 Wm82-2 Gmdme-1 Gmdme-2; do
+  stringtie "bam/${s}.sorted.bam" \
+    -G "$GTF" \
+    -e \
+    -A "stringtie/abund/${s}.gene_abundance.tsv" \
+    -o "stringtie/gtf/${s}.stringtie.gtf" \
+    -p 16 \
+    2> "stringtie/logs/${s}.stringtie.log"
+done
+
+
+
+
+#deseq2统计差异表达
+#读取Counts矩阵、整理 count 矩阵、组间对比、导出 DEG 表
+vim 01_deseq2_fit.R
+rm(list = ls())
+suppressPackageStartupMessages({
+  library(DESeq2)
+})
+
+dir.create("deseq2_out", showWarnings = FALSE)
+
+# 读取数据
+cts <- read.delim("count/gene_counts.txt", comment.char="#", check.names=FALSE)
+rownames(cts) <- cts$Geneid
+count_mat <- as.matrix(cts[, grep("\\.sorted\\.bam$", colnames(cts))])
+storage.mode(count_mat) <- "integer"
+colnames(count_mat) <- sub("\\.sorted\\.bam$", "", basename(colnames(count_mat)))
+
+# 样本分组
+sample_info <- data.frame(
+  sample = c("Wm82-1","Wm82-2","Gmdme-1","Gmdme-2"),
+  group  = c("Wm82","Wm82","Gmdme","Gmdme"),
+  stringsAsFactors = FALSE
+)
+sample_info$group <- factor(sample_info$group, levels = c("Wm82","Gmdme"))
+rownames(sample_info) <- sample_info$sample
+sample_info <- sample_info[colnames(count_mat), , drop = FALSE]
+
+stopifnot(all(rownames(sample_info) == colnames(count_mat)))
+write.csv(sample_info, "deseq2_out/sample_info.csv", row.names=FALSE)
+
+# 过滤低表达基因
+keep <- rowSums(count_mat) > 0
+count_mat <- count_mat[keep, ]
+
+dds <- DESeqDataSetFromMatrix(countData = count_mat,
+                              colData = sample_info,
+                              design = ~ group)
+dds <- DESeq(dds)
+
+# 保存对象
+saveRDS(dds, file="deseq2_out/dds.rds")
+
+# 保存 VST
+vsd <- vst(dds, blind = TRUE)
+saveRDS(vsd, file="deseq2_out/vsd.rds")
+
+# 导出 DEG
+res1 <- results(dds, contrast = c("group", "Gmdme", "Wm82"))
+res1 <- res1[order(res1$padj), ]
+write.csv(as.data.frame(res1), "deseq2_out/DEG_Gmdme_vs_Wm82.csv")
+
+cat("Done: deseq2_out/ (dds.rds, vsd.rds, DEG csv)\n")
+Rscript 01_deseq2_fit.R
+
+vim 02_pca_all_genes.R
+rm(list = ls())
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(ggrepel)
+  library(DESeq2)  
+})
+
+vsd <- readRDS("deseq2_out/vsd.rds")
+sample_info <- read.csv("deseq2_out/sample_info.csv", stringsAsFactors=FALSE)
+rownames(sample_info) <- sample_info$sample
+
+mat <- assay(vsd)          # 基因 × 样本
+mat_t <- t(mat)            # 样本 × 基因
+
+use_scale <- FALSE
+
+if (use_scale) {
+  mat_t <- mat_t[, apply(mat_t, 2, var) > 0, drop=FALSE]
+}
+
+pc <- prcomp(mat_t, center=TRUE, scale.=use_scale)
+percentVar <- pc$sdev^2 / sum(pc$sdev^2) * 100
+
+pca_df <- data.frame(
+  sample = rownames(pc$x),
+  PC1 = pc$x[,1],
+  PC2 = pc$x[,2]
+)
+pca_df$group <- sample_info[pca_df$sample, "group"]
+
+p <- ggplot(pca_df, aes(PC1, PC2, color=group, label=sample)) +
+  geom_point(size=4) +
+  geom_text_repel(size=3, max.overlaps = Inf) +
+  xlab(sprintf("PC1: %.1f%%", percentVar[1])) +
+  ylab(sprintf("PC2: %.1f%%", percentVar[2])) +
+  theme_bw()
+
+ggsave("deseq2_out/PCA_all_genes.pdf", p, width=10, height=7)
+ggsave("deseq2_out/PCA_all_genes.png", p, width=10, height=7, dpi=300)
+write.csv(pca_df, "deseq2_out/PCA_all_genes_points.csv", row.names=FALSE)
+
+cat("Done: PCA_all_genes.pdf/png\n")
+Rscript 02_pca_all_genes.R
+
+vim 03_sample_correlation_pheatmap.R
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(pheatmap)
+})
+
+vsd <- readRDS("deseq2_out/vsd.rds")
+mat <- assay(vsd)
+
+# Pearson 相关性
+cor_mat <- cor(mat, method = "pearson")
+write.csv(cor_mat, file = "deseq2_out/sample_correlation_pearson.csv")
+
+# 距离矩阵：1 - 相关性（用于聚类）
+dist_mat <- as.dist(1 - cor_mat)
+
+pdf("deseq2_out/sample_correlation_pheatmap.pdf", width = 7, height = 6)
+pheatmap(
+  cor_mat,
+  clustering_distance_rows = dist_mat,
+  clustering_distance_cols = dist_mat,
+  clustering_method = "complete",
+  display_numbers = TRUE,
+  number_format = "%.2f",
+  border_color = NA
+)
+dev.off()
+
+cat("Done: deseq2_out/sample_correlation_pheatmap.pdf\n")
+Rscript 03_sample_correlation_pheatmap.R
+
+vim 04_split_up_down.R
+rm(list=ls())
+
+padj_cut <- 0.05
+lfc_cut  <- 1
+
+dir.create("deseq2_out", showWarnings = FALSE)
+
+comparisons <- list(
+  Gmdme_vs_Wm82    = "deseq2_out/DEG_Gmdme_vs_Wm82.csv"
+)
+
+summary_list <- list()
+
+for (cmp in names(comparisons)) {
+  infile <- comparisons[[cmp]]
+  if (!file.exists(infile)) {
+    cat("[WARN] missing:", infile, "\n")
+    next
+  }
+
+  res <- read.csv(infile, row.names = 1, check.names = FALSE)
+
+  # 处理 NA
+  if (!("padj" %in% colnames(res)) || !("log2FoldChange" %in% colnames(res))) {
+    stop("File missing padj or log2FoldChange: ", infile)
+  }
+  res$padj[is.na(res$padj)] <- 1
+  res$log2FoldChange[is.na(res$log2FoldChange)] <- 0
+
+  sig <- res[res$padj < padj_cut & abs(res$log2FoldChange) >= lfc_cut, , drop=FALSE]
+  up   <- sig[sig$log2FoldChange > 0, , drop=FALSE]
+  down <- sig[sig$log2FoldChange < 0, , drop=FALSE]
+
+  # 输出完整表
+  write.csv(up,   file = sprintf("deseq2_out/Up_%s_padj%.2g_lfc%d.csv",   cmp, padj_cut, lfc_cut))
+  write.csv(down, file = sprintf("deseq2_out/Down_%s_padj%.2g_lfc%d.csv", cmp, padj_cut, lfc_cut))
+
+  # 输出基因ID列表（用于GO/KEGG）
+  write.table(rownames(up),
+              file = sprintf("deseq2_out/Up_%s_padj%.2g_lfc%d.genes.txt", cmp, padj_cut, lfc_cut),
+              quote = FALSE, row.names = FALSE, col.names = FALSE)
+  write.table(rownames(down),
+              file = sprintf("deseq2_out/Down_%s_padj%.2g_lfc%d.genes.txt", cmp, padj_cut, lfc_cut),
+              quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+  # 汇总统计
+  summary_list[[cmp]] <- data.frame(
+    comparison = cmp,
+    total_genes = nrow(res),
+    sig_genes   = nrow(sig),
+    up_genes    = nrow(up),
+    down_genes  = nrow(down)
+  )
+
+  cat("[OK]", cmp, "sig:", nrow(sig), "up:", nrow(up), "down:", nrow(down), "\n")
+}
+
+summary_df <- do.call(rbind, summary_list)
+write.csv(summary_df, "deseq2_out/DEG_up_down_summary_padj0.05_lfc1.csv", row.names = FALSE)
+cat("Done: deseq2_out/DEG_up_down_summary_padj0.05_lfc1.csv\n")
+Rscript 04_split_up_down.R
+
+vim make_qc_deg_table.py
+#!/usr/bin/env python3
+import re
+import os
+import glob
+import csv
+
+PADJ_CUT = 0.05
+LFC_CUT = 1.0
+
+def read_text(path):
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+def parse_fastp_log(path):
+    """
+    Return dict: clean_pairs (Read1 after filtering total reads), dup_rate, insert_size
+    """
+    txt = read_text(path)
+
+    m = re.search(r"Read1 after filtering:\s*?\n.*?total reads:\s*(\d+)", txt, re.S)
+    clean_pairs = int(m.group(1)) if m else None
+
+    m = re.search(r"Duplication rate:\s*([\d\.]+)%", txt)
+    dup_rate = float(m.group(1)) if m else None
+
+    m = re.search(r"Insert size peak.*?:\s*(\d+)", txt)
+    insert_size = int(m.group(1)) if m else None
+
+    return {"clean_pairs": clean_pairs, "dup_rate": dup_rate, "insert_size": insert_size}
+
+def parse_hisat2_log(path):
+    """
+    Return dict: mapping_ratio, concord_exact1, concord_gt1, concord_total
+    """
+    txt = read_text(path)
+
+    m = re.search(r"([\d\.]+)%\s+overall alignment rate", txt)
+    mapping_ratio = float(m.group(1)) if m else None
+
+    m1 = re.search(r"(\d+)\s+\([\d\.]+%\)\s+aligned concordantly exactly 1 time", txt)
+    exact1 = int(m1.group(1)) if m1 else 0
+
+    m2 = re.search(r"(\d+)\s+\([\d\.]+%\)\s+aligned concordantly >1 times", txt)
+    gt1 = int(m2.group(1)) if m2 else 0
+
+    concord_total = exact1 + gt1
+    return {"mapping_ratio": mapping_ratio, "concord_total": concord_total}
+
+def parse_deg_csv(path):
+    """
+    Return dict: sig/up/down using PADJ_CUT & |LFC|>=LFC_CUT
+    """
+    # DESeq2 csv: rownames are gene IDs; columns include log2FoldChange, padj
+    sig = up = down = 0
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                lfc = float(row.get("log2FoldChange", "nan"))
+            except:
+                continue
+            padj_str = row.get("padj", "")
+            try:
+                padj = float(padj_str) if padj_str not in ("", "NA", "NaN", None) else 1.0
+            except:
+                padj = 1.0
+
+            if padj < PADJ_CUT and abs(lfc) >= LFC_CUT:
+                sig += 1
+                if lfc > 0:
+                    up += 1
+                elif lfc < 0:
+                    down += 1
+    return {"sig": sig, "up": up, "down": down}
+
+def main():
+    logs_dir = "logs"
+    deg_dir = "deseq2_out"
+    out_xlsx = "Gmdme_vs_Wm82_RNAseq_QC_DEG.xlsx"
+    out_qc_csv = "Gmdme_vs_Wm82_Mapping_QC.csv"
+    out_deg_csv = "Gmdme_vs_Wm82_DEG_summary.csv"
+
+    # -------- Mapping/QC table (per sample) --------
+    fastp_logs = {os.path.basename(p).replace(".fastp.log",""): p
+                  for p in glob.glob(os.path.join(logs_dir, "*.fastp.log"))}
+    hisat2_logs = {os.path.basename(p).replace(".hisat2.log",""): p
+                   for p in glob.glob(os.path.join(logs_dir, "*.hisat2.log"))}
+
+    samples = sorted(set(fastp_logs.keys()) & set(hisat2_logs.keys()))
+    qc_rows = []
+    for s in samples:
+        fp = parse_fastp_log(fastp_logs[s])
+        hs = parse_hisat2_log(hisat2_logs[s])
+
+        clean_pairs = fp["clean_pairs"]
+        concord = hs["concord_total"]
+        concord_ratio = (concord / clean_pairs * 100.0) if (clean_pairs and concord) else None
+
+        qc_rows.append({
+            "Sample": s,
+            "Clean_data_pairs": clean_pairs,
+            "Mapping_ratio_%": hs["mapping_ratio"],
+            "Aligned_concordantly_pairs": concord,
+            "Concordantly_ratio_%": round(concord_ratio, 2) if concord_ratio is not None else None,
+            "Duplication_rate_%": fp["dup_rate"],
+            "Insert_size_peak": fp["insert_size"],
+        })
+
+    # write QC csv
+    with open(out_qc_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(qc_rows[0].keys()) if qc_rows else [])
+        w.writeheader()
+        for r in qc_rows:
+            w.writerow(r)
+
+    # -------- DEG summary table (per comparison) --------
+    deg_files = sorted(glob.glob(os.path.join(deg_dir, "DEG_*.csv")))
+    deg_rows = []
+    for p in deg_files:
+        name = os.path.basename(p).replace("DEG_", "").replace(".csv", "")
+        stat = parse_deg_csv(p)
+        deg_rows.append({
+            "Comparison": name,
+            "padj_cut": PADJ_CUT,
+            "abs_log2FC_cut": LFC_CUT,
+            "Sig_genes": stat["sig"],
+            "Up_genes": stat["up"],
+            "Down_genes": stat["down"],
+        })
+
+    with open(out_deg_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(deg_rows[0].keys()) if deg_rows else [])
+        w.writeheader()
+        for r in deg_rows:
+            w.writerow(r)
+
+    # -------- optional: write xlsx (2 sheets) --------
+    try:
+        from openpyxl import Workbook
+        from openpyxl.utils import get_column_letter
+        from openpyxl.styles import Font, Alignment
+
+        wb = Workbook()
+        wb.remove(wb.active)
+
+        def add_sheet(title, rows):
+            ws = wb.create_sheet(title)
+            if not rows:
+                return
+            headers = list(rows[0].keys())
+            ws.append(headers)
+            for r in rows:
+                ws.append([r.get(h) for h in headers])
+
+            # style
+            bold = Font(bold=True)
+            for c in range(1, len(headers)+1):
+                ws.cell(row=1, column=c).font = bold
+                ws.cell(row=1, column=c).alignment = Alignment(horizontal="center")
+
+            ws.freeze_panes = "A2"
+            # auto width (rough)
+            for c, h in enumerate(headers, start=1):
+                maxlen = max(len(str(h)), max(len(str(ws.cell(row=r, column=c).value or "")) for r in range(2, ws.max_row+1)))
+                ws.column_dimensions[get_column_letter(c)].width = min(maxlen + 2, 40)
+
+        add_sheet("Mapping_QC", qc_rows)
+        add_sheet("DEG_summary", deg_rows)
+        wb.save(out_xlsx)
+        print(f"[OK] Wrote {out_xlsx} (and {out_qc_csv}, {out_deg_csv})")
+    except Exception as e:
+        print(f"[WARN] openpyxl not available or failed ({e}). Wrote CSV only: {out_qc_csv}, {out_deg_csv}")
+
+if __name__ == "__main__":
+    main()
+python3 make_qc_deg_table.py
+
+#清理列名（后面有清理操作，可不清）
+sed 's/\.Wm82\.a4\.v1$//' deseq2_out/Up_Gmdme_vs_Wm82_padj0.05_lfc1.genes.txt \
+  > deseq2_out/Up_Gmdme_vs_Wm82.cleanedID.txt
+sed 's/\.Wm82\.a4\.v1$//' deseq2_out/Down_Gmdme_vs_Wm82_padj0.05_lfc1.genes.txt > deseq2_out/Down_Gmdme_vs_Wm82.cleanedID.txt
+
+conda activate rnaseq_r
+vim 05_enrich_GO_KEGG.R
+rm(list=ls())
+suppressPackageStartupMessages({
+  library(clusterProfiler)
+  library(enrichplot)
+  library(dplyr)
+  library(readr)
+  library(ggplot2)
+})
+
+go_file   <- "/mnt/nfs2/stu_fy/hms/GO_KEGG_annotation/Williams_82.GO.txt"
+kegg_file <- "/mnt/nfs2/stu_fy/hms/GO_KEGG_annotation/Williams_82.KEGG.txt"
+dds_rds   <- "deseq2_out/dds.rds"
+genes_dir <- "deseq2_out"
+outdir    <- "enrich_out"
+dir.create(outdir, showWarnings=FALSE)
+
+clean_id <- function(x) sub("\\.Wm82\\.a4\\.v1$", "", x)
+dds <- readRDS(dds_rds)
+bg_all <- clean_id(rownames(dds))
+
+# ===================== GO =====================
+go_raw <- read.delim(go_file, sep="\t", header=TRUE, stringsAsFactors=FALSE, check.names=FALSE)
+
+# Level -> ontology
+go_raw$Ontology <- dplyr::case_when(
+  go_raw$Level %in% c("Biological Process","biological process") ~ "BP",
+  go_raw$Level %in% c("Cellular Component","cellular component") ~ "CC",
+  go_raw$Level %in% c("Molecular Function","molecular function") ~ "MF",
+  TRUE ~ NA_character_
+)
+
+go_term2gene <- go_raw %>%
+  dplyr::select(term = GO, gene = Gene) %>%
+  filter(!is.na(term), term!="", !is.na(gene), gene!="") %>%
+  distinct()
+
+go_term2name <- go_raw %>%
+  dplyr::select(term = GO, name = Description, ontology = Ontology) %>%
+  filter(!is.na(term), term!="") %>%
+  distinct()
+
+bg_go <- intersect(bg_all, unique(go_term2gene$gene))
+
+# ===================== KEGG (Pathway) =====================
+k_raw <- read.delim(kegg_file, sep="\t", header=TRUE, stringsAsFactors=FALSE, check.names=FALSE)
+
+kegg_pw_term2gene <- k_raw %>%
+  dplyr::select(term = Pathway, gene = Gene) %>%
+  filter(!is.na(term), term!="", !is.na(gene), gene!="") %>%
+  distinct()
+
+kegg_pw_term2name <- k_raw %>%
+  dplyr::select(term = Pathway, name = Description) %>%
+  filter(!is.na(term), term!="") %>%
+  distinct()
+
+bg_kegg_pw <- intersect(bg_all, unique(kegg_pw_term2gene$gene))
+
+# ======= (可选) KEGG KO 富集：想跑KO就打开 =======
+do_kegg_ko <- FALSE
+if (do_kegg_ko) {
+  kegg_ko_term2gene <- k_raw %>%
+    dplyr::select(term = KO, gene = Gene) %>%
+    filter(!is.na(term), term!="", !is.na(gene), gene!="") %>%
+    distinct()
+  kegg_ko_term2name <- k_raw %>%
+    dplyr::select(term = KO, name = KO) %>%
+    filter(!is.na(term), term!="") %>%
+    distinct()
+  bg_kegg_ko <- intersect(bg_all, unique(kegg_ko_term2gene$gene))
+}
+
+# ===================== enrichment runner =====================
+run_enrich <- function(genes, universe, term2gene, term2name, prefix, subdir){
+  od <- file.path(outdir, subdir)
+  dir.create(od, showWarnings=FALSE, recursive=TRUE)
+
+  genes <- unique(genes)
+  genes <- intersect(genes, universe)
+
+  if (length(genes) < 5) {
+    message("[SKIP] ", prefix, " genes < 5 after intersect universe")
+    return(NULL)
+  }
+
+  eg <- enricher(
+    gene          = genes,
+    universe      = universe,
+    TERM2GENE     = term2gene,
+    TERM2NAME     = term2name,
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05,
+    qvalueCutoff  = 0.05,
+    minGSSize     = 10,
+    maxGSSize     = 500
+  )
+
+  if (is.null(eg) || nrow(as.data.frame(eg))==0) {
+    message("[EMPTY] ", prefix)
+    return(NULL)
+  }
+
+  res <- as.data.frame(eg)
+  write.csv(res, file.path(od, paste0(prefix, ".enrich.csv")), row.names=FALSE)
+
+  pdf(file.path(od, paste0(prefix, ".dotplot.pdf")), width=9, height=6)
+  print(dotplot(eg, showCategory=10))
+  dev.off()
+
+  pdf(file.path(od, paste0(prefix, ".barplot.pdf")), width=9, height=6)
+  print(barplot(eg, showCategory=10))
+  dev.off()
+
+  return(eg)
+}
+
+# ===================== loop gene lists =====================
+gene_files <- list.files(genes_dir, pattern="\\.cleanedID\\.txt$", full.names=TRUE)
+if (length(gene_files)==0) stop("No *.genes.txt found in deseq2_out/ (Up/Down gene lists)")
+
+for (f in gene_files) {
+  set_name <- sub("\\.cleanedID\\.txt$", "", basename(f))
+  genes <- clean_id(readLines(f))
+  genes <- genes[genes!=""]
+
+  message("== ", set_name, " (n=", length(genes), ") ==")
+
+  # -------- GO (overall) --------
+  eg_go <- run_enrich(
+    genes     = genes,
+    universe  = bg_go,
+    term2gene = go_term2gene,
+    term2name = go_term2name %>% dplyr::select(term, name),
+    prefix    = set_name,
+    subdir    = "GO"
+  )
+
+  # -------- GO split BP/CC/MF (基于表里的Level) --------
+  if (!is.null(eg_go)) {
+    go_res <- as.data.frame(eg_go) %>%
+      left_join(go_term2name, by=c("ID"="term"))
+    write.csv(go_res, file.path(outdir, "GO", paste0(set_name, ".with_ontology.csv")), row.names=FALSE)
+
+    for (ont in c("BP","CC","MF")) {
+      sub <- go_res %>% filter(ontology==ont)
+      if (nrow(sub)==0) next
+      write.csv(sub, file.path(outdir, "GO", paste0(set_name, ".", ont, ".csv")), row.names=FALSE)
+    }
+  }
+
+  # -------- KEGG Pathway --------
+  run_enrich(
+    genes     = genes,
+    universe  = bg_kegg_pw,
+    term2gene = kegg_pw_term2gene,
+    term2name = kegg_pw_term2name,
+    prefix    = set_name,
+    subdir    = "KEGG_Pathway"
+  )
+
+  # -------- (可选) KEGG KO --------
+  if (do_kegg_ko) {
+    run_enrich(
+      genes     = genes,
+      universe  = bg_kegg_ko,
+      term2gene = kegg_ko_term2gene,
+      term2name = kegg_ko_term2name,
+      prefix    = set_name,
+      subdir    = "KEGG_KO"
+    )
+  }
+}
+message("Done. Results in enrich_out/")
+Rscript 05_enrich_GO_KEGG.R
+
+
+vim 05_1_go_facet_dotplot.R
+rm(list=ls())
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(stringr)
+})
+
+# ========= 参数区 =========
+in_dir  <- "enrich_out/GO"
+out_dir <- file.path(in_dir, "facet_plots")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+topN <- 10
+use_p_adjust_for_color <- FALSE   # TRUE: -log10(p.adjust)；FALSE: -log10(pvalue)
+export_png <- TRUE
+exclude_obsolete <- FALSE
+
+# 字体大小/加粗
+base_size <- 15
+axis_text_size <- 11
+strip_text_size <- 12
+title_size <- 16
+
+# 颜色：低蓝高红
+low_col  <- "blue"
+high_col <- "red"
+
+# ========= 工具函数 =========
+parse_ratio <- function(x) {
+  sp <- strsplit(as.character(x), "/", fixed = TRUE)
+  vapply(sp, function(z) as.numeric(z[1]) / as.numeric(z[2]), numeric(1))
+}
+clean_y_labels <- function(x) sub("\\|\\|.*$", "", x)
+
+make_plot_one <- function(infile, outpdf, plot_title) {
+  df <- read.csv(infile, check.names = FALSE)
+
+  need_cols <- c("ID","Description","GeneRatio","Count","pvalue","p.adjust","ontology")
+  miss <- setdiff(need_cols, colnames(df))
+  if (length(miss) > 0) {
+    message("[SKIP] missing cols: ", paste(miss, collapse=","), " in ", infile)
+    return(invisible(FALSE))
+  }
+
+  df$GeneRatio_num <- parse_ratio(df$GeneRatio)
+  score <- if (use_p_adjust_for_color) df$p.adjust else df$pvalue
+  df$neglog10 <- -log10(score + 1e-300)
+
+  df2 <- df %>%
+    filter(ontology %in% c("BP","CC","MF")) %>%
+    filter(!is.na(Description), Description != "") %>%
+    { if (exclude_obsolete) filter(., !grepl("obsolete", Description, ignore.case = TRUE)) else . } %>%
+    group_by(ontology) %>%
+    arrange(p.adjust, pvalue) %>%   # 每个本体内按显著性取TopN
+    slice_head(n = topN) %>%
+    ungroup()
+
+  if (nrow(df2) == 0) {
+    message("[EMPTY] ", basename(infile))
+    return(invisible(FALSE))
+  }
+
+  # facet标签换成全称
+  df2$ontology <- factor(
+    df2$ontology,
+    levels = c("BP","CC","MF"),
+    labels = c("Biological Process","Cellular Component","Molecular Function")
+  )
+
+  # 每个分面内部排序（这里按GeneRatio；也可改成按neglog10）
+  df2 <- df2 %>%
+    mutate(Description = stringr::str_wrap(Description, width = 50)) %>%
+    group_by(ontology) %>%
+    arrange(GeneRatio_num, .by_group = TRUE) %>%
+    mutate(term_facet = paste0(Description, "||", ontology)) %>%
+    ungroup()
+
+  df2$term_facet <- factor(df2$term_facet, levels = df2$term_facet)
+
+  p <- ggplot(df2, aes(x = GeneRatio_num, y = term_facet)) +
+    geom_point(aes(size = Count, color = neglog10)) +
+    scale_color_gradient(low = low_col, high = high_col) +
+    facet_grid(ontology ~ ., scales = "free_y", space = "free_y") +
+    scale_y_discrete(labels = clean_y_labels) +
+    labs(
+      title = plot_title,
+      x = "Gene Ratio",
+      y = "GO Terms",
+      color = if (use_p_adjust_for_color) "-log10(p.adjust)" else "-log10(pvalue)",
+      size  = "Gene Count"
+    ) +
+    theme_bw(base_size = base_size) +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = title_size, face = "bold"),
+      axis.title = element_text(size = base_size, face = "bold"),
+      axis.text  = element_text(size = axis_text_size, face = "bold"),
+      strip.text.y = element_text(angle = 90, size = strip_text_size, face = "bold"),
+      legend.title = element_text(face = "bold"),
+      legend.text  = element_text(face = "bold")
+    )
+
+  ggsave(outpdf, p, width = 11, height = 10)
+
+  if (export_png) {
+    outpng <- sub("\\.pdf$", ".png", outpdf)
+    ggsave(outpng, p, width = 11, height = 10, dpi = 300)
+  }
+
+  invisible(TRUE)
+}
+
+# ========= 批量处理 =========
+files <- list.files(in_dir, pattern = "\\.with_ontology\\.csv$", full.names = TRUE)
+if (length(files) == 0) stop("No *.with_ontology.csv found in ", in_dir)
+
+ok <- 0
+for (f in files) {
+  base <- sub("\\.with_ontology\\.csv$", "", basename(f))
+  outpdf <- file.path(out_dir, paste0(base, ".BPCCMF_top", topN, ".pdf"))
+  message("[PLOT] ", base)
+  if (make_plot_one(f, outpdf, plot_title = base)) ok <- ok + 1
+}
+message("Done. Plotted ", ok, " files. Output: ", out_dir)
+Rscript 05_1_go_facet_dotplot.R
+
+
+vim 06_GSEA_GO_KEGG.R
+rm(list = ls())
+suppressPackageStartupMessages({
+  library(clusterProfiler)
+  library(dplyr)
+})
+
+# ========= 参数 =========
+deg_file  <- "deseq2_out/DEG_Gmdme_vs_Wm82.csv"
+go_file   <- "/mnt/nfs2/stu_fy/hms/GO_KEGG_annotation/Williams_82.GO.txt"
+kegg_file <- "/mnt/nfs2/stu_fy/hms/GO_KEGG_annotation/Williams_82.KEGG.txt"
+outdir    <- "gsea_out"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+clean_id <- function(x) sub("\\.Wm82\\.a4\\.v1$", "", x)
+
+# ========= 1. 准备全基因排序列表 =========
+res <- read.csv(deg_file, row.names = 1, check.names = FALSE)
+res$Gene_raw <- rownames(res)
+res$Gene <- clean_id(res$Gene_raw)
+
+# 优先用 DESeq2 的 stat；没有的话用 sign(log2FC) * -log10(pvalue)
+if ("stat" %in% colnames(res)) {
+  res$rank_score <- res$stat
+} else {
+  res$pvalue[is.na(res$pvalue)] <- 1
+  res$log2FoldChange[is.na(res$log2FoldChange)] <- 0
+  res$rank_score <- sign(res$log2FoldChange) * -log10(res$pvalue + 1e-300)
+}
+
+rank_df <- res %>%
+  filter(!is.na(Gene), Gene != "", !is.na(rank_score), is.finite(rank_score)) %>%
+  group_by(Gene) %>%
+  slice_max(order_by = abs(rank_score), n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(desc(rank_score))
+
+geneList <- rank_df$rank_score
+names(geneList) <- rank_df$Gene
+geneList <- sort(geneList, decreasing = TRUE)
+
+cat("[INFO] ranked genes:", length(geneList), "\n")
+
+# ========= 2. GO 注释 =========
+go_raw <- read.delim(go_file, sep = "\t", header = TRUE, stringsAsFactors = FALSE, check.names = FALSE)
+go_raw$Gene <- clean_id(go_raw$Gene)
+
+go_raw$ontology <- dplyr::case_when(
+  go_raw$Level %in% c("Biological Process", "biological process") ~ "BP",
+  go_raw$Level %in% c("Cellular Component", "cellular component") ~ "CC",
+  go_raw$Level %in% c("Molecular Function", "molecular function") ~ "MF",
+  TRUE ~ NA_character_
+)
+
+go_term2gene <- go_raw %>%
+  dplyr::select(term = GO, gene = Gene) %>%
+  filter(!is.na(term), term != "", !is.na(gene), gene != "") %>%
+  distinct()
+
+go_term2name <- go_raw %>%
+  dplyr::select(term = GO, name = Description, ontology) %>%
+  filter(!is.na(term), term != "", !is.na(name), name != "") %>%
+  distinct()
+
+# ========= 3. KEGG 注释（按 Pathway 做） =========
+k_raw <- read.delim(kegg_file, sep = "\t", header = TRUE, stringsAsFactors = FALSE, check.names = FALSE)
+k_raw$Gene <- clean_id(k_raw$Gene)
+
+kegg_term2gene <- k_raw %>%
+  dplyr::select(term = Pathway, gene = Gene) %>%
+  filter(!is.na(term), term != "", !is.na(gene), gene != "") %>%
+  distinct()
+
+kegg_term2name <- k_raw %>%
+  dplyr::select(term = Pathway, name = Description) %>%
+  filter(!is.na(term), term != "", !is.na(name), name != "") %>%
+  distinct()
+
+# ========= 4. 跑 GO GSEA =========
+gsea_go <- GSEA(
+  geneList      = geneList,
+  TERM2GENE     = go_term2gene,
+  TERM2NAME     = go_term2name %>% dplyr::select(term, name),
+  pvalueCutoff  = 1,
+  pAdjustMethod = "BH",
+  minGSSize     = 10,
+  maxGSSize     = 500,
+  verbose       = FALSE,
+  seed          = TRUE,
+  eps           = 0
+)
+
+if (!is.null(gsea_go) && nrow(as.data.frame(gsea_go)) > 0) {
+  go_res <- as.data.frame(gsea_go) %>%
+    left_join(go_term2name %>% dplyr::select(term, ontology) %>% distinct(),
+              by = c("ID" = "term"))
+
+  write.csv(go_res, file.path(outdir, "GO_GSEA_all.csv"), row.names = FALSE)
+  write.csv(go_res %>% filter(ontology == "BP"), file.path(outdir, "GO_GSEA_BP.csv"), row.names = FALSE)
+  write.csv(go_res %>% filter(ontology == "CC"), file.path(outdir, "GO_GSEA_CC.csv"), row.names = FALSE)
+  write.csv(go_res %>% filter(ontology == "MF"), file.path(outdir, "GO_GSEA_MF.csv"), row.names = FALSE)
+  saveRDS(gsea_go, file.path(outdir, "GO_GSEA.rds"))
+  cat("[OK] GO GSEA done\n")
+} else {
+  cat("[WARN] GO GSEA empty\n")
+}
+
+# ========= 5. 跑 KEGG GSEA =========
+gsea_kegg <- GSEA(
+  geneList      = geneList,
+  TERM2GENE     = kegg_term2gene,
+  TERM2NAME     = kegg_term2name,
+  pvalueCutoff  = 1,
+  pAdjustMethod = "BH",
+  minGSSize     = 5,
+  maxGSSize     = 500,
+  verbose       = FALSE,
+  seed          = TRUE,
+  eps           = 0
+)
+
+if (!is.null(gsea_kegg) && nrow(as.data.frame(gsea_kegg)) > 0) {
+  kegg_res <- as.data.frame(gsea_kegg)
+  write.csv(kegg_res, file.path(outdir, "KEGG_GSEA_all.csv"), row.names = FALSE)
+  saveRDS(gsea_kegg, file.path(outdir, "KEGG_GSEA.rds"))
+  cat("[OK] KEGG GSEA done\n")
+} else {
+  cat("[WARN] KEGG GSEA empty\n")
+}
+
+cat("Done. Results in:", outdir, "\n")
+Rscript 06_GSEA_GO_KEGG.R
+
+vim 07_plot_GSEA_summary.R
+rm(list = ls())
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(stringr)
+})
+
+dir.create("gsea_out/plots", showWarnings = FALSE, recursive = TRUE)
+
+topN <- 10
+padj_cut <- 0.25   # GSEA 常先看 0.25；若想严格可改 0.05
+
+plot_gsea_summary <- function(infile, out_prefix, title_text) {
+  df <- read.csv(infile, check.names = FALSE)
+
+  need_cols <- c("Description", "NES", "p.adjust", "setSize")
+  miss <- setdiff(need_cols, colnames(df))
+  if (length(miss) > 0) {
+    stop("Missing columns in ", infile, ": ", paste(miss, collapse = ", "))
+  }
+
+  df <- df %>%
+    filter(!is.na(NES), !is.na(p.adjust)) %>%
+    filter(p.adjust < padj_cut)
+
+  if (nrow(df) == 0) {
+    message("[EMPTY] ", infile, " under padj <", padj_cut)
+    return(invisible(NULL))
+  }
+
+  pos <- df %>%
+    filter(NES > 0) %>%
+    arrange(desc(NES), p.adjust) %>%
+    slice_head(n = topN)
+
+  neg <- df %>%
+    filter(NES < 0) %>%
+    arrange(NES, p.adjust) %>%
+    slice_head(n = topN)
+
+  df2 <- bind_rows(pos, neg)
+
+  if (nrow(df2) == 0) {
+    message("[EMPTY] no positive/negative terms selected for ", infile)
+    return(invisible(NULL))
+  }
+
+  df2 <- df2 %>%
+    mutate(
+      Direction = ifelse(NES > 0, "Gmdme", "Wm82"),
+      Description = str_wrap(Description, width = 35),
+      neglog10 = -log10(p.adjust + 1e-300)
+    ) %>%
+    arrange(NES)
+
+  df2$Description <- factor(df2$Description, levels = df2$Description)
+
+  p <- ggplot(df2, aes(x = NES, y = Description)) +
+    geom_vline(xintercept = 0, linetype = 2, color = "grey40") +
+    geom_point(aes(size = setSize, color = neglog10)) +
+    scale_color_gradient(low = "blue", high = "red") +
+    labs(
+      title = title_text,
+      x = "Normalized Enrichment Score (NES)",
+      y = NULL,
+      color = expression(-log[10](adjusted~p)),
+      size = "Gene set size"
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+      axis.text.y = element_text(face = "bold", size = 10),
+      axis.title.x = element_text(face = "bold"),
+      legend.title = element_text(face = "bold"),
+      legend.text = element_text(face = "bold")
+    )
+
+  ggsave(paste0(out_prefix, ".pdf"), p, width = 11, height = 8)
+  ggsave(paste0(out_prefix, ".png"), p, width = 11, height = 8, dpi = 300)
+}
+
+# GO overall
+plot_gsea_summary(
+  infile = "gsea_out/GO_GSEA_all.csv",
+  out_prefix = "gsea_out/plots/GO_GSEA_summary_top10_pos_neg",
+  title_text = "GO GSEA summary (Gmdme vs Wm82)"
+)
+
+# KEGG overall
+plot_gsea_summary(
+  infile = "gsea_out/KEGG_GSEA_all.csv",
+  out_prefix = "gsea_out/plots/KEGG_GSEA_summary_top10_pos_neg",
+  title_text = "KEGG GSEA summary (Gmdme vs Wm82)"
+)
+
+cat("Done. Summary plots in gsea_out/plots/\n")
+Rscript 07_plot_GSEA_summary.R
