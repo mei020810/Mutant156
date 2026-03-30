@@ -981,3 +981,316 @@ plot_gsea_summary(
 
 cat("Done. Summary plots in gsea_out/plots/\n")
 Rscript 07_plot_GSEA_summary.R
+
+vim 08_make_expr_summary_same_style.R
+rm(list = ls())
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(data.table)
+})
+
+# ========= 参数 =========
+dds_rds <- "deseq2_out/dds.rds"
+out_csv <- "deseq2_out/Gmdme_vs_Wm82_expr_summary.csv"
+
+padj_cut <- 0.05
+lfc_cut  <- 1
+
+# 样本顺序按你想要的固定
+samples <- c("Wm82-1", "Wm82-2", "Gmdme-1", "Gmdme-2")
+
+# StringTie abundance 文件
+abund_files <- c(
+  "Wm82-1"  = "stringtie/abund/Wm82-1.gene_abundance.tsv",
+  "Wm82-2"  = "stringtie/abund/Wm82-2.gene_abundance.tsv",
+  "Gmdme-1" = "stringtie/abund/Gmdme-1.gene_abundance.tsv",
+  "Gmdme-2" = "stringtie/abund/Gmdme-2.gene_abundance.tsv"
+)
+
+clean_id <- function(x) sub("\\.Wm82\\.a4\\.v1$", "", x)
+
+# ========= 1. 读 DESeq2 =========
+dds <- readRDS(dds_rds)
+
+raw_counts  <- counts(dds, normalized = FALSE)
+norm_counts <- counts(dds, normalized = TRUE)
+
+# 固定列顺序
+raw_counts  <- raw_counts[, samples, drop = FALSE]
+norm_counts <- norm_counts[, samples, drop = FALSE]
+
+gene_raw   <- rownames(dds)
+gene_clean <- clean_id(gene_raw)
+
+# ========= 2. 整理 raw / norm =========
+raw_df <- as.data.frame(raw_counts, check.names = FALSE)
+colnames(raw_df) <- paste0("raw_", colnames(raw_df))
+
+norm_df <- as.data.frame(norm_counts, check.names = FALSE)
+colnames(norm_df) <- paste0("norm_", colnames(norm_df))
+
+out <- data.frame(
+  Gene = gene_raw,
+  Gene_clean = gene_clean,
+  raw_df,
+  norm_df,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+# ========= 3. DESeq2 结果 =========
+res <- results(dds, contrast = c("group", "Gmdme", "Wm82"))
+res_df <- as.data.frame(res, check.names = FALSE)
+res_df$Gene <- rownames(res_df)
+
+res_df$padj[is.na(res_df$padj)] <- 1
+res_df$log2FoldChange[is.na(res_df$log2FoldChange)] <- 0
+res_df$pvalue[is.na(res_df$pvalue)] <- 1
+
+res_df$DEG <- res_df$padj < padj_cut & abs(res_df$log2FoldChange) >= lfc_cut
+res_df$Direction <- ifelse(
+  res_df$DEG & res_df$log2FoldChange > 0, "Up",
+  ifelse(res_df$DEG & res_df$log2FoldChange < 0, "Down", "NS")
+)
+
+res_df <- res_df[, c("Gene", "baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj", "DEG", "Direction")]
+colnames(res_df) <- c(
+  "Gene",
+  "Gmdme_vs_Wm82_baseMean",
+  "Gmdme_vs_Wm82_log2FoldChange",
+  "Gmdme_vs_Wm82_lfcSE",
+  "Gmdme_vs_Wm82_stat",
+  "Gmdme_vs_Wm82_pvalue",
+  "Gmdme_vs_Wm82_padj",
+  "Gmdme_vs_Wm82_DEG",
+  "Gmdme_vs_Wm82_Direction"
+)
+
+out <- merge(out, res_df, by = "Gene", all.x = TRUE, sort = FALSE)
+
+# ========= 4. 读取并合并 StringTie abundance =========
+read_abundance_one <- function(file, sample_name) {
+  dt <- fread(file, sep = "\t", header = TRUE, check.names = FALSE)
+
+  # 兼容列名
+  gene_col <- if ("Gene ID" %in% names(dt)) "Gene ID" else names(dt)[grepl("^Gene", names(dt))][1]
+  fpkm_col <- if ("FPKM" %in% names(dt)) "FPKM" else names(dt)[toupper(names(dt)) == "FPKM"][1]
+  tpm_col  <- if ("TPM"  %in% names(dt)) "TPM"  else names(dt)[toupper(names(dt)) == "TPM"][1]
+
+  if (is.na(gene_col) || is.na(fpkm_col) || is.na(tpm_col)) {
+    stop("Cannot find Gene ID / FPKM / TPM columns in: ", file)
+  }
+
+  dt2 <- dt[, .(
+    Gene = get(gene_col),
+    tmp_FPKM = as.numeric(get(fpkm_col)),
+    tmp_TPM  = as.numeric(get(tpm_col))
+  )]
+
+  setnames(dt2, c("tmp_FPKM", "tmp_TPM"), c(paste0("FPKM_", sample_name), paste0("TPM_", sample_name)))
+  dt2
+}
+
+abund_merged <- NULL
+for (s in samples) {
+  f <- abund_files[[s]]
+  if (!file.exists(f)) stop("Missing abundance file: ", f)
+
+  dt_one <- read_abundance_one(f, s)
+  if (is.null(abund_merged)) {
+    abund_merged <- dt_one
+  } else {
+    abund_merged <- merge(abund_merged, dt_one, by = "Gene", all = TRUE, sort = FALSE)
+  }
+}
+
+# 补 Gene_clean
+abund_merged$Gene_clean <- clean_id(abund_merged$Gene)
+
+# 把 abundance 的 Gene 对齐到 dds 的 Gene
+# 优先按原始 Gene 合并；如果对不上，再按 Gene_clean 兜底
+out <- merge(out, abund_merged[, c("Gene", grep("^(TPM|FPKM)_", names(abund_merged), value = TRUE)), with = FALSE],
+             by = "Gene", all.x = TRUE, sort = FALSE)
+
+# 如果还有缺失，按 Gene_clean 补
+na_rows <- which(rowSums(is.na(out[, grep("^(TPM|FPKM)_", names(out)), drop = FALSE])) > 0)
+if (length(na_rows) > 0) {
+  abund_clean <- abund_merged[, c("Gene_clean", grep("^(TPM|FPKM)_", names(abund_merged), value = TRUE)), with = FALSE]
+  out2 <- merge(
+    out[na_rows, c("Gene_clean"), drop = FALSE],
+    abund_clean,
+    by = "Gene_clean",
+    all.x = TRUE,
+    sort = FALSE
+  )
+  for (cn in grep("^(TPM|FPKM)_", names(out2), value = TRUE)) {
+    out[na_rows, cn] <- out2[[cn]]
+  }
+}
+
+# ========= 5. 按之前风格重排列 =========
+raw_cols  <- paste0("raw_", samples)
+norm_cols <- paste0("norm_", samples)
+tpm_cols  <- paste0("TPM_", samples)
+fpkm_cols <- paste0("FPKM_", samples)
+
+final_cols <- c(
+  "Gene",
+  "Gene_clean",
+  raw_cols,
+  norm_cols,
+  "Gmdme_vs_Wm82_baseMean",
+  "Gmdme_vs_Wm82_log2FoldChange",
+  "Gmdme_vs_Wm82_lfcSE",
+  "Gmdme_vs_Wm82_stat",
+  "Gmdme_vs_Wm82_pvalue",
+  "Gmdme_vs_Wm82_padj",
+  "Gmdme_vs_Wm82_DEG",
+  "Gmdme_vs_Wm82_Direction",
+  tpm_cols,
+  fpkm_cols
+)
+
+final_cols <- final_cols[final_cols %in% names(out)]
+out <- out[, final_cols, drop = FALSE]
+
+fwrite(out, out_csv)
+cat("Done:", out_csv, "\n")
+Rscript 08_make_expr_summary_same_style.R
+
+
+vim 09_export_summary_plot_core_genes.R
+rm(list = ls())
+suppressPackageStartupMessages({
+  library(dplyr)
+})
+
+dir.create("gsea_out/summary_plot_core_genes", showWarnings = FALSE, recursive = TRUE)
+
+topN <- 10
+padj_cut <- 0.25
+
+safe_name <- function(x) {
+  x <- gsub("[^A-Za-z0-9_]+", "_", x)
+  x <- gsub("_+", "_", x)
+  x <- gsub("^_|_$", "", x)
+  x
+}
+
+export_summary_plot_core_genes <- function(infile, prefix) {
+  df <- read.csv(infile, check.names = FALSE)
+
+  need_cols <- c("ID", "Description", "NES", "p.adjust", "core_enrichment")
+  miss <- setdiff(need_cols, colnames(df))
+  if (length(miss) > 0) {
+    stop("Missing columns in ", infile, ": ", paste(miss, collapse = ", "))
+  }
+
+  df <- df %>%
+    filter(!is.na(NES), !is.na(p.adjust), !is.na(core_enrichment), core_enrichment != "") %>%
+    filter(p.adjust < padj_cut)
+
+  if (nrow(df) == 0) {
+    message("[EMPTY] ", infile)
+    return(invisible(NULL))
+  }
+
+  pos <- df %>%
+    filter(NES > 0) %>%
+    arrange(desc(NES), p.adjust) %>%
+    slice_head(n = topN)
+
+  neg <- df %>%
+    filter(NES < 0) %>%
+    arrange(NES, p.adjust) %>%
+    slice_head(n = topN)
+
+  df2 <- bind_rows(pos, neg) %>%
+    mutate(Direction = ifelse(NES > 0, "Gmdme_side", "Wm82_side"))
+
+  if (nrow(df2) == 0) {
+    message("[EMPTY] no selected terms in ", infile)
+    return(invisible(NULL))
+  }
+
+  summary_rows <- list()
+  long_rows <- list()
+
+  for (i in seq_len(nrow(df2))) {
+    term_id   <- df2$ID[i]
+    term_desc <- df2$Description[i]
+    direction <- df2$Direction[i]
+    nes       <- df2$NES[i]
+    padj      <- df2$p.adjust[i]
+
+    genes <- unique(strsplit(df2$core_enrichment[i], "/", fixed = TRUE)[[1]])
+    genes <- genes[genes != ""]
+
+    summary_rows[[i]] <- data.frame(
+      Category = prefix,
+      ID = term_id,
+      Description = term_desc,
+      Direction = direction,
+      NES = nes,
+      p.adjust = padj,
+      Core_gene_count = length(genes),
+      Core_genes = paste(genes, collapse = ";"),
+      stringsAsFactors = FALSE
+    )
+
+    if (length(genes) > 0) {
+      long_rows[[i]] <- data.frame(
+        Category = prefix,
+        ID = term_id,
+        Description = term_desc,
+        Direction = direction,
+        NES = nes,
+        p.adjust = padj,
+        Gene = genes,
+        stringsAsFactors = FALSE
+      )
+    }
+
+    out_name <- paste0(
+      prefix, "_",
+      direction, "_",
+      safe_name(term_desc),
+      ".genes.txt"
+    )
+
+    write.table(
+      genes,
+      file = file.path("gsea_out/summary_plot_core_genes", out_name),
+      quote = FALSE, row.names = FALSE, col.names = FALSE
+    )
+  }
+
+  summary_df <- bind_rows(summary_rows)
+  write.csv(
+    summary_df,
+    file = file.path("gsea_out/summary_plot_core_genes", paste0(prefix, "_summary_plot_core_genes.csv")),
+    row.names = FALSE
+  )
+
+  if (length(long_rows) > 0) {
+    long_df <- bind_rows(long_rows)
+    write.csv(
+      long_df,
+      file = file.path("gsea_out/summary_plot_core_genes", paste0(prefix, "_summary_plot_core_genes_long.csv")),
+      row.names = FALSE
+    )
+  }
+}
+
+export_summary_plot_core_genes(
+  "gsea_out/GO_GSEA_all.csv",
+  "GO_GSEA"
+)
+
+export_summary_plot_core_genes(
+  "gsea_out/KEGG_GSEA_all.csv",
+  "KEGG_GSEA"
+)
+
+cat("Done. Files written to gsea_out/summary_plot_core_genes/\n")
+Rscript 09_export_summary_plot_core_genes.R
