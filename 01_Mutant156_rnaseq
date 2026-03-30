@@ -1002,3 +1002,373 @@ for s in Wm82_big_1 Wm82_big_2 M156_big_1 M156_big_2 M156_small_1 M156_small_2; 
 done
 ##
 
+
+vim 06_GSEA_GO_KEGG.R
+rm(list = ls())
+suppressPackageStartupMessages({
+  library(clusterProfiler)
+  library(dplyr)
+})
+
+# ========= 参数 =========
+deg_file  <- "deseq2_out/DEG_M156big_vs_Wm82big.csv"
+go_file   <- "/mnt/nfs2/stu_fy/hms/GO_KEGG_annotation/Williams_82.GO.txt"
+kegg_file <- "/mnt/nfs2/stu_fy/hms/GO_KEGG_annotation/Williams_82.KEGG.txt"
+outdir    <- "gsea_out_M156big_vs_Wm82big"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+clean_id <- function(x) sub("\\.Wm82\\.a4\\.v1$", "", x)
+
+# ========= 1. 准备全基因排序列表 =========
+res <- read.csv(deg_file, row.names = 1, check.names = FALSE)
+res$Gene_raw <- rownames(res)
+res$Gene <- clean_id(res$Gene_raw)
+
+# 优先用 DESeq2 的 stat；没有的话用 sign(log2FC) * -log10(pvalue)
+if ("stat" %in% colnames(res)) {
+  res$rank_score <- res$stat
+} else {
+  res$pvalue[is.na(res$pvalue)] <- 1
+  res$log2FoldChange[is.na(res$log2FoldChange)] <- 0
+  res$rank_score <- sign(res$log2FoldChange) * -log10(res$pvalue + 1e-300)
+}
+
+rank_df <- res %>%
+  filter(!is.na(Gene), Gene != "", !is.na(rank_score), is.finite(rank_score)) %>%
+  group_by(Gene) %>%
+  slice_max(order_by = abs(rank_score), n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(desc(rank_score))
+
+geneList <- rank_df$rank_score
+names(geneList) <- rank_df$Gene
+geneList <- sort(geneList, decreasing = TRUE)
+
+cat("[INFO] ranked genes:", length(geneList), "\n")
+
+# ========= 2. GO 注释 =========
+go_raw <- read.delim(go_file, sep = "\t", header = TRUE, stringsAsFactors = FALSE, check.names = FALSE)
+go_raw$Gene <- clean_id(go_raw$Gene)
+
+go_raw$ontology <- dplyr::case_when(
+  go_raw$Level %in% c("Biological Process", "biological process") ~ "BP",
+  go_raw$Level %in% c("Cellular Component", "cellular component") ~ "CC",
+  go_raw$Level %in% c("Molecular Function", "molecular function") ~ "MF",
+  TRUE ~ NA_character_
+)
+
+go_term2gene <- go_raw %>%
+  dplyr::select(term = GO, gene = Gene) %>%
+  filter(!is.na(term), term != "", !is.na(gene), gene != "") %>%
+  distinct()
+
+go_term2name <- go_raw %>%
+  dplyr::select(term = GO, name = Description, ontology) %>%
+  filter(!is.na(term), term != "", !is.na(name), name != "") %>%
+  distinct()
+
+# ========= 3. KEGG 注释（按 Pathway 做） =========
+k_raw <- read.delim(kegg_file, sep = "\t", header = TRUE, stringsAsFactors = FALSE, check.names = FALSE)
+k_raw$Gene <- clean_id(k_raw$Gene)
+
+kegg_term2gene <- k_raw %>%
+  dplyr::select(term = Pathway, gene = Gene) %>%
+  filter(!is.na(term), term != "", !is.na(gene), gene != "") %>%
+  distinct()
+
+kegg_term2name <- k_raw %>%
+  dplyr::select(term = Pathway, name = Description) %>%
+  filter(!is.na(term), term != "", !is.na(name), name != "") %>%
+  distinct()
+
+# ========= 4. 跑 GO GSEA =========
+gsea_go <- GSEA(
+  geneList      = geneList,
+  TERM2GENE     = go_term2gene,
+  TERM2NAME     = go_term2name %>% dplyr::select(term, name),
+  pvalueCutoff  = 1,
+  pAdjustMethod = "BH",
+  minGSSize     = 10,
+  maxGSSize     = 500,
+  verbose       = FALSE,
+  seed          = TRUE,
+  eps           = 0
+)
+
+if (!is.null(gsea_go) && nrow(as.data.frame(gsea_go)) > 0) {
+  go_res <- as.data.frame(gsea_go) %>%
+    left_join(go_term2name %>% dplyr::select(term, ontology) %>% distinct(),
+              by = c("ID" = "term"))
+
+  write.csv(go_res, file.path(outdir, "GO_GSEA_all.csv"), row.names = FALSE)
+  write.csv(go_res %>% filter(ontology == "BP"), file.path(outdir, "GO_GSEA_BP.csv"), row.names = FALSE)
+  write.csv(go_res %>% filter(ontology == "CC"), file.path(outdir, "GO_GSEA_CC.csv"), row.names = FALSE)
+  write.csv(go_res %>% filter(ontology == "MF"), file.path(outdir, "GO_GSEA_MF.csv"), row.names = FALSE)
+  saveRDS(gsea_go, file.path(outdir, "GO_GSEA.rds"))
+  cat("[OK] GO GSEA done\n")
+} else {
+  cat("[WARN] GO GSEA empty\n")
+}
+
+# ========= 5. 跑 KEGG GSEA =========
+gsea_kegg <- GSEA(
+  geneList      = geneList,
+  TERM2GENE     = kegg_term2gene,
+  TERM2NAME     = kegg_term2name,
+  pvalueCutoff  = 1,
+  pAdjustMethod = "BH",
+  minGSSize     = 5,
+  maxGSSize     = 500,
+  verbose       = FALSE,
+  seed          = TRUE,
+  eps           = 0
+)
+
+if (!is.null(gsea_kegg) && nrow(as.data.frame(gsea_kegg)) > 0) {
+  kegg_res <- as.data.frame(gsea_kegg)
+  write.csv(kegg_res, file.path(outdir, "KEGG_GSEA_all.csv"), row.names = FALSE)
+  saveRDS(gsea_kegg, file.path(outdir, "KEGG_GSEA.rds"))
+  cat("[OK] KEGG GSEA done\n")
+} else {
+  cat("[WARN] KEGG GSEA empty\n")
+}
+
+cat("Done. Results in:", outdir, "\n")
+Rscript 06_GSEA_GO_KEGG.R
+
+vim 07_plot_GSEA_summary.R
+rm(list = ls())
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(stringr)
+})
+
+dir.create("gsea_out_M156big_vs_Wm82big/plots", showWarnings = FALSE, recursive = TRUE)
+
+topN <- 10
+padj_cut <- 0.25   # GSEA 常先看 0.25；若想严格可改 0.05
+
+plot_gsea_summary <- function(infile, out_prefix, title_text) {
+  df <- read.csv(infile, check.names = FALSE)
+
+  need_cols <- c("Description", "NES", "p.adjust", "setSize")
+  miss <- setdiff(need_cols, colnames(df))
+  if (length(miss) > 0) {
+    stop("Missing columns in ", infile, ": ", paste(miss, collapse = ", "))
+  }
+
+  df <- df %>%
+    filter(!is.na(NES), !is.na(p.adjust)) %>%
+    filter(p.adjust < padj_cut)
+
+  if (nrow(df) == 0) {
+    message("[EMPTY] ", infile, " under padj <", padj_cut)
+    return(invisible(NULL))
+  }
+
+  pos <- df %>%
+    filter(NES > 0) %>%
+    arrange(desc(NES), p.adjust) %>%
+    slice_head(n = topN)
+
+  neg <- df %>%
+    filter(NES < 0) %>%
+    arrange(NES, p.adjust) %>%
+    slice_head(n = topN)
+
+  df2 <- bind_rows(pos, neg)
+
+  if (nrow(df2) == 0) {
+    message("[EMPTY] no positive/negative terms selected for ", infile)
+    return(invisible(NULL))
+  }
+
+  df2 <- df2 %>%
+    mutate(
+      Direction = ifelse(NES > 0, "M156big", "Wm82big"),
+      Description = str_wrap(Description, width = 35),
+      neglog10 = -log10(p.adjust + 1e-300)
+    ) %>%
+    arrange(NES)
+
+  df2$Description <- factor(df2$Description, levels = df2$Description)
+
+  p <- ggplot(df2, aes(x = NES, y = Description)) +
+    geom_vline(xintercept = 0, linetype = 2, color = "grey40") +
+    geom_point(aes(size = setSize, color = neglog10)) +
+    scale_color_gradient(low = "blue", high = "red") +
+    labs(
+      title = title_text,
+      x = "Normalized Enrichment Score (NES)",
+      y = NULL,
+      color = expression(-log[10](adjusted~p)),
+      size = "Gene set size"
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+      axis.text.y = element_text(face = "bold", size = 10),
+      axis.title.x = element_text(face = "bold"),
+      legend.title = element_text(face = "bold"),
+      legend.text = element_text(face = "bold")
+    )
+
+  ggsave(paste0(out_prefix, ".pdf"), p, width = 11, height = 8)
+  ggsave(paste0(out_prefix, ".png"), p, width = 11, height = 8, dpi = 300)
+}
+
+# GO overall
+plot_gsea_summary(
+  infile = "gsea_out_M156big_vs_Wm82big/GO_GSEA_all.csv",
+  out_prefix = "gsea_out_M156big_vs_Wm82big/plots/GO_GSEA_summary_top10_pos_neg",
+  title_text = "GO GSEA summary (M156big vs Wm82big)"
+)
+
+# KEGG overall
+plot_gsea_summary(
+  infile = "gsea_out_M156big_vs_Wm82big/KEGG_GSEA_all.csv",
+  out_prefix = "gsea_out_M156big_vs_Wm82big/plots/KEGG_GSEA_summary_top10_pos_neg",
+  title_text = "KEGG GSEA summary (M156big vs Wm82big)"
+)
+
+cat("Done. Summary plots in gsea_out_M156big_vs_Wm82big/plots/\n")
+Rscript 07_plot_GSEA_summary.R
+
+vim 08_export_summary_plot_core_genes.R
+rm(list = ls())
+suppressPackageStartupMessages({
+  library(dplyr)
+})
+
+dir.create("gsea_out_M156big_vs_Wm82big/summary_plot_core_genes", showWarnings = FALSE, recursive = TRUE)
+
+topN <- 10
+padj_cut <- 0.25   # 与 summary 图时一致
+
+safe_name <- function(x) {
+  x <- gsub("[^A-Za-z0-9_]+", "_", x)
+  x <- gsub("_+", "_", x)
+  x <- gsub("^_|_$", "", x)
+  x
+}
+
+export_summary_plot_core_genes <- function(infile, prefix) {
+  df <- read.csv(infile, check.names = FALSE)
+
+  need_cols <- c("ID", "Description", "NES", "p.adjust", "core_enrichment")
+  miss <- setdiff(need_cols, colnames(df))
+  if (length(miss) > 0) {
+    stop("Missing columns in ", infile, ": ", paste(miss, collapse = ", "))
+  }
+
+  df <- df %>%
+    filter(!is.na(NES), !is.na(p.adjust), !is.na(core_enrichment), core_enrichment != "") %>%
+    filter(p.adjust < padj_cut)
+
+  if (nrow(df) == 0) {
+    message("[EMPTY] ", infile)
+    return(invisible(NULL))
+  }
+
+  pos <- df %>%
+    filter(NES > 0) %>%
+    arrange(desc(NES), p.adjust) %>%
+    slice_head(n = topN)
+
+  neg <- df %>%
+    filter(NES < 0) %>%
+    arrange(NES, p.adjust) %>%
+    slice_head(n = topN)
+
+  df2 <- bind_rows(pos, neg) %>%
+    mutate(Direction = ifelse(NES > 0, "M156big_side", "Wm82big_side"))
+
+  if (nrow(df2) == 0) {
+    message("[EMPTY] no selected terms in ", infile)
+    return(invisible(NULL))
+  }
+
+  summary_rows <- list()
+  long_rows <- list()
+
+  for (i in seq_len(nrow(df2))) {
+    term_id   <- df2$ID[i]
+    term_desc <- df2$Description[i]
+    direction <- df2$Direction[i]
+    nes       <- df2$NES[i]
+    padj      <- df2$p.adjust[i]
+
+    genes <- unique(strsplit(df2$core_enrichment[i], "/", fixed = TRUE)[[1]])
+    genes <- genes[genes != ""]
+
+    summary_rows[[i]] <- data.frame(
+      Category = prefix,
+      ID = term_id,
+      Description = term_desc,
+      Direction = direction,
+      NES = nes,
+      p.adjust = padj,
+      Core_gene_count = length(genes),
+      Core_genes = paste(genes, collapse = ";"),
+      stringsAsFactors = FALSE
+    )
+
+    if (length(genes) > 0) {
+      long_rows[[i]] <- data.frame(
+        Category = prefix,
+        ID = term_id,
+        Description = term_desc,
+        Direction = direction,
+        NES = nes,
+        p.adjust = padj,
+        Gene = genes,
+        stringsAsFactors = FALSE
+      )
+    }
+
+    out_name <- paste0(
+      prefix, "_",
+      direction, "_",
+      safe_name(term_desc),
+      ".genes.txt"
+    )
+
+    write.table(
+      genes,
+      file = file.path("gsea_out_M156big_vs_Wm82big/summary_plot_core_genes", out_name),
+      quote = FALSE, row.names = FALSE, col.names = FALSE
+    )
+  }
+
+  summary_df <- bind_rows(summary_rows)
+  write.csv(
+    summary_df,
+    file = file.path("gsea_out_M156big_vs_Wm82big/summary_plot_core_genes", paste0(prefix, "_summary_plot_core_genes.csv")),
+    row.names = FALSE
+  )
+
+  if (length(long_rows) > 0) {
+    long_df <- bind_rows(long_rows)
+    write.csv(
+      long_df,
+      file = file.path("gsea_out_M156big_vs_Wm82big/summary_plot_core_genes", paste0(prefix, "_summary_plot_core_genes_long.csv")),
+      row.names = FALSE
+    )
+  }
+}
+
+# GO summary 图里的通路
+export_summary_plot_core_genes(
+  "gsea_out_M156big_vs_Wm82big/GO_GSEA_all.csv",
+  "GO_GSEA"
+)
+
+# KEGG summary 图里的通路
+export_summary_plot_core_genes(
+  "gsea_out_M156big_vs_Wm82big/KEGG_GSEA_all.csv",
+  "KEGG_GSEA"
+)
+
+cat("Done. Files written to gsea_out_M156big_vs_Wm82big/summary_plot_core_genes/\n")
+Rscript 08_export_summary_plot_core_genes.R
